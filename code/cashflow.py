@@ -40,9 +40,16 @@ def _normalize_interval(mode_gap: int) -> int:
     return mode_gap
 
 
+def series_key_for_event(event: dict[str, Any]) -> tuple[str, str, str]:
+    """Public helper: (category, direction, event_type)."""
+    return _group_key(event)
+
+
 def detect_recurring_series(
     events: list[dict[str, Any]],
     as_of: date,
+    *,
+    include_flexible: bool = True,
 ) -> list[RecurringSeries]:
     """Detect recurring cash series from settled history (and scheduled income)."""
     by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -70,11 +77,26 @@ def detect_recurring_series(
         is_income = direction == "credit" or event_type == "income"
 
         if is_income:
+            settled = [
+                e
+                for e in items
+                if str(e.get("status", "")).lower() == "settled"
+                and e["settlement_date"] < as_of
+            ]
             has_scheduled = any(str(e.get("status", "")).lower() == "scheduled" for e in items)
-            # Do not project income from settled history alone (avoids inventing pay).
-            if not has_scheduled:
-                continue
-            if len(items) < 2:
+            # Split mixed pay streams (base salary vs irregular bonus) by amount band.
+            if not has_scheduled and settled:
+                by_band: dict[int, list[dict[str, Any]]] = defaultdict(list)
+                for event in settled:
+                    band = int(round(float(event["amount_home"]) / 1000.0))
+                    by_band[band].append(event)
+                settled = max(by_band.values(), key=len)
+            if has_scheduled:
+                if len(items) < 2:
+                    continue
+            elif len(settled) >= 3:
+                items = settled
+            else:
                 continue
         else:
             settled = [
@@ -88,8 +110,12 @@ def detect_recurring_series(
                 str(e.get("flexibility") or "").lower() for e in settled
             )
             dominant_flex = flex_counts.most_common(1)[0][0] if flex_counts else ""
-            # Optional cuts are handled in a later phase; exclude from base forecast.
-            if dominant_flex in {"reducible", "stoppable"}:
+            if not include_flexible and dominant_flex in {
+                "reducible",
+                "stoppable",
+                "reducible_or_stoppable",
+                "flexible",
+            }:
                 continue
             items = settled
 
@@ -138,9 +164,11 @@ def _confirmed_future_deltas(
     events: list[dict[str, Any]],
     request_date: date,
     end_date: date,
+    stopped_keys: set[tuple[str, str, str]] | None = None,
 ) -> tuple[dict[date, float], set[tuple[tuple[str, str, str], date]]]:
     deltas: dict[date, float] = defaultdict(float)
     occupied: set[tuple[tuple[str, str, str], date]] = set()
+    stopped_keys = stopped_keys or set()
 
     for event in events:
         if not event.get("include_in_cashflow"):
@@ -152,6 +180,9 @@ def _confirmed_future_deltas(
         settlement = event["settlement_date"]
         if settlement < request_date or settlement > end_date:
             continue
+        key = _group_key(event)
+        if direction == "debit" and key in stopped_keys:
+            continue
         if status == "pending" and direction == "debit":
             pass
         elif status == "scheduled" and direction in {"debit", "credit"}:
@@ -160,7 +191,7 @@ def _confirmed_future_deltas(
             continue
         amount = float(event["amount_home"])
         deltas[settlement] += _signed_amount(direction, amount)
-        occupied.add((_group_key(event), settlement))
+        occupied.add((key, settlement))
     return deltas, occupied
 
 
@@ -168,10 +199,18 @@ def build_daily_deltas(
     events: list[dict[str, Any]],
     request_date: date,
     horizon_days: int = 90,
+    series_overrides: dict[tuple[str, str, str], float | None] | None = None,
 ) -> dict[date, float]:
-    """Net cash deltas per day from confirmed futures + projected recurrings."""
+    """Net cash deltas per day from confirmed futures + projected recurrings.
+
+    series_overrides maps series key -> None (stop) or a float (reduced amount).
+    """
+    overrides = series_overrides or {}
+    stopped_keys = {key for key, value in overrides.items() if value is None}
     end_date = request_date + timedelta(days=horizon_days)
-    deltas, occupied = _confirmed_future_deltas(events, request_date, end_date)
+    deltas, occupied = _confirmed_future_deltas(
+        events, request_date, end_date, stopped_keys=stopped_keys
+    )
 
     for event in events:
         if not event.get("include_in_cashflow"):
@@ -180,15 +219,24 @@ def build_daily_deltas(
         if status not in {"pending", "scheduled"}:
             continue
         settlement = event["settlement_date"]
+        key = _group_key(event)
+        if key in stopped_keys and str(event.get("direction", "")).lower() == "debit":
+            continue
         if request_date <= settlement <= end_date:
-            occupied.add((_group_key(event), settlement))
+            occupied.add((key, settlement))
 
-    for series in detect_recurring_series(events, request_date):
-        cursor = series.last_settlement + timedelta(days=series.interval_days)
+    for series in detect_recurring_series(events, request_date, include_flexible=True):
         key = (series.category, series.direction, series.event_type)
+        if key in overrides:
+            if overrides[key] is None:
+                continue
+            amount = float(overrides[key])  # type: ignore[arg-type]
+        else:
+            amount = series.amount
+        cursor = series.last_settlement + timedelta(days=series.interval_days)
         while cursor <= end_date:
             if cursor > request_date and (key, cursor) not in occupied:
-                deltas[cursor] += _signed_amount(series.direction, series.amount)
+                deltas[cursor] += _signed_amount(series.direction, amount)
                 occupied.add((key, cursor))
             cursor += timedelta(days=series.interval_days)
     return dict(deltas)

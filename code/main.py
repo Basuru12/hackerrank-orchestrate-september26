@@ -64,8 +64,10 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
     method_exact = 0
     status_exact = 0
     plan_exact = 0
+    changes_exact = 0
     total = len(data.sample_requests)
     mismatches: list[str] = []
+    focus_ids = {"request_06", "request_11", "request_21", "request_01"}
 
     for sample in data.sample_requests:
         request_id = sample["request_id"]
@@ -92,6 +94,7 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         label_method = sample.get("recommended_payment_method")
         label_status = sample.get("affordability_status")
         label_plan = _normalize_plan(sample.get("payment_plan"))
+        label_changes = _normalize_plan(sample.get("spending_changes_needed"))
 
         pred_safe = decision.amount_safe_to_pay
         pred_earliest = decision.earliest_date_for_full_payment
@@ -110,23 +113,28 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         method_ok = decision.recommended_payment_method == label_method
         status_ok = decision.affordability_status == label_status
         plan_ok = _normalize_plan(decision.payment_plan) == label_plan
+        changes_ok = _normalize_plan(decision.spending_changes_needed) == label_changes
         if method_ok:
             method_exact += 1
         if status_ok:
             status_exact += 1
         if plan_ok:
             plan_exact += 1
+        if changes_ok:
+            changes_exact += 1
 
-        print(
-            f"{request_id}: method pred={decision.recommended_payment_method} "
-            f"label={label_method} | status pred={decision.affordability_status} "
-            f"label={label_status} | plan_ok={plan_ok} | "
-            f"safe pred={pred_safe} label={label_safe}"
-        )
-        if not (method_ok and status_ok and plan_ok):
+        if request_id in focus_ids or not (method_ok and status_ok and changes_ok):
+            print(
+                f"{request_id}: method pred={decision.recommended_payment_method} "
+                f"label={label_method} | status pred={decision.affordability_status} "
+                f"label={label_status} | changes pred={decision.spending_changes_needed!r} "
+                f"label={label_changes!r} | plan_ok={plan_ok}"
+            )
+        if not (method_ok and status_ok and plan_ok and changes_ok):
             mismatches.append(
                 f"{request_id}: method {decision.recommended_payment_method}!={label_method}; "
                 f"status {decision.affordability_status}!={label_status}; "
+                f"changes {decision.spending_changes_needed!r}!={label_changes!r}; "
                 f"plan pred={decision.payment_plan!r} label={label_plan!r}"
             )
 
@@ -136,14 +144,14 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         f"earliest_exact={earliest_exact}/{total} "
         f"method_exact={method_exact}/{total} "
         f"status_exact={status_exact}/{total} "
-        f"plan_exact={plan_exact}/{total}"
+        f"plan_exact={plan_exact}/{total} "
+        f"changes_exact={changes_exact}/{total}"
     )
     if mismatches:
         print("mismatches (up to 10):")
         for line in mismatches[:10]:
             print(f"  {line}")
 
-    # Keep cashflow import referenced for clarity in smoke tooling.
     _ = cashflow
     return 0
 
