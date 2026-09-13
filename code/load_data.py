@@ -19,6 +19,9 @@ class Dataset:
     rates: list[dict[str, Any]] = field(default_factory=list)
     rates_by_key: dict[tuple[date, str, str], float] = field(default_factory=dict)
     sample_requests: list[dict[str, Any]] = field(default_factory=list)
+    messages_by_user: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    messages_by_request: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    images_by_event: dict[str, str] = field(default_factory=dict)
     fx_missing_count: int = 0
 
 
@@ -262,6 +265,30 @@ def load_dataset(dataset_dir: Path) -> Dataset:
         for row in _read_csv(dataset_dir / "sample_requests.csv")
     ]
 
+    messages_by_user: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    messages_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in _read_csv(dataset_dir / "messages.csv"):
+        msg: dict[str, Any] = dict(row)
+        sent_raw = (row.get("sent_at") or "").strip()
+        msg["sent_at"] = (
+            datetime.fromisoformat(sent_raw.replace("Z", "+00:00"))
+            if sent_raw
+            else None
+        )
+        user_id = row.get("user_id") or ""
+        request_id = (row.get("request_id") or "").strip()
+        if user_id:
+            messages_by_user[user_id].append(msg)
+        if request_id:
+            messages_by_request[request_id].append(msg)
+
+    images_by_event: dict[str, str] = {}
+    for row in _read_csv(dataset_dir / "images.csv"):
+        event_id = (row.get("related_event_id") or "").strip()
+        image_id = (row.get("image_id") or "").strip()
+        if event_id and image_id:
+            images_by_event[event_id] = image_id
+
     return Dataset(
         requests=requests,
         profiles_by_user=profiles_by_user,
@@ -270,5 +297,8 @@ def load_dataset(dataset_dir: Path) -> Dataset:
         rates=rates,
         rates_by_key=rates_by_key,
         sample_requests=sample_requests,
+        messages_by_user=dict(messages_by_user),
+        messages_by_request=dict(messages_by_request),
+        images_by_event=images_by_event,
         fx_missing_count=fx_missing_count,
     )

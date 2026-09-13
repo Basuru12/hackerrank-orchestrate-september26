@@ -32,6 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _run_load_smoke(data: load_data.Dataset) -> int:
     event_count = sum(len(events) for events in data.events_by_user.values())
     option_count = sum(len(opts) for opts in data.options_by_request.values())
+    msg_count = sum(len(msgs) for msgs in data.messages_by_user.values())
     print(
         "loaded "
         f"requests={len(data.requests)} "
@@ -39,7 +40,9 @@ def _run_load_smoke(data: load_data.Dataset) -> int:
         f"events={event_count} "
         f"options={option_count} "
         f"rates={len(data.rates)} "
-        f"samples={len(data.sample_requests)}"
+        f"samples={len(data.sample_requests)} "
+        f"messages={msg_count} "
+        f"images={len(data.images_by_event)}"
     )
     first = data.requests[0]
     user_id = first["user_id"]
@@ -76,12 +79,16 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         events = data.events_by_user.get(user_id, [])
         options = data.options_by_request.get(request_id, [])
 
+        messages = data.messages_by_user.get(user_id, [])
         decision = decide.decide_for_request(
             sample,
             profile=profile,
             events=events,
             options=options,
             rates=data.rates,
+            messages=messages,
+            images_by_event=data.images_by_event,
+            rates_by_key=data.rates_by_key,
         )
 
         label_safe = float(sample.get("amount_safe_to_pay", 0) or 0)

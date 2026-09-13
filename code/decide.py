@@ -495,6 +495,7 @@ def _search_with_spending_changes(
     earliest: date | None,
     starting_balance: float,
     minimum: float,
+    series_amount_forces: dict[tuple[str, str, str], float] | None = None,
 ) -> list[Candidate]:
     actions = discover_spending_actions(events, profile, request["request_date"])
     if not actions:
@@ -513,7 +514,10 @@ def _search_with_spending_changes(
             changes = _format_action_set(combo)
             overrides = _overrides_from_actions(combo)
             deltas = cashflow.build_daily_deltas(
-                events, request_date, series_overrides=overrides
+                events,
+                request_date,
+                series_overrides=overrides,
+                series_amount_forces=series_amount_forces,
             )
             candidates = _build_candidates(
                 request,
@@ -536,14 +540,31 @@ def decide_for_request(
     events: list[dict[str, Any]] | None = None,
     options: list[dict[str, Any]] | None = None,
     rates: list[dict[str, Any]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    images_by_event: dict[str, str] | None = None,
+    rates_by_key: dict[tuple[date, str, str], float] | None = None,
 ) -> Decision:
     """Choose the best eligible safe payment recommendation for one request."""
+    import evidence
+
     request_id = str(request.get("request_id", ""))
     if profile is None:
         profile = {}
-    events = events or []
+    events = list(events or [])
     options = options or []
     rates = rates or []
+    messages = messages or []
+    images_by_event = images_by_event or {}
+
+    events, meta = evidence.apply_evidence(
+        events,
+        messages,
+        images_by_event,
+        profile,
+        request,
+        rates_by_key=rates_by_key,
+    )
+    salary_forces = evidence.salary_series_overrides(meta)
 
     request_date: date = request["request_date"]
     req = float(request["requested_amount"])
@@ -559,6 +580,7 @@ def decide_for_request(
         events,
         currency,
         rates,
+        series_amount_forces=salary_forces,
     )
     earliest = cashflow.earliest_full_payment_date(
         starting_balance,
@@ -568,8 +590,11 @@ def decide_for_request(
         events,
         currency,
         rates,
+        series_amount_forces=salary_forces,
     )
-    daily_deltas = cashflow.build_daily_deltas(events, request_date)
+    daily_deltas = cashflow.build_daily_deltas(
+        events, request_date, series_amount_forces=salary_forces
+    )
 
     candidates = _build_candidates(
         request,
@@ -592,6 +617,7 @@ def decide_for_request(
         earliest,
         starting_balance,
         minimum,
+        series_amount_forces=salary_forces,
     )
     candidates.extend(cut_candidates)
 

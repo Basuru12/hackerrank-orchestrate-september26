@@ -83,21 +83,27 @@ def detect_recurring_series(
                 if str(e.get("status", "")).lower() == "settled"
                 and e["settlement_date"] < as_of
             ]
-            has_scheduled = any(str(e.get("status", "")).lower() == "scheduled" for e in items)
+            scheduled_items = [
+                e for e in items if str(e.get("status", "")).lower() == "scheduled"
+            ]
+            has_scheduled = bool(scheduled_items)
             # Split mixed pay streams (base salary vs irregular bonus) by amount band.
-            if not has_scheduled and settled:
+            if settled:
                 by_band: dict[int, list[dict[str, Any]]] = defaultdict(list)
                 for event in settled:
                     band = int(round(float(event["amount_home"]) / 1000.0))
                     by_band[band].append(event)
                 settled = max(by_band.values(), key=len)
             if has_scheduled:
-                if len(items) < 2:
+                if len(settled) < 2 and len(settled) + len(scheduled_items) < 2:
                     continue
+                # Prefer settled history for cadence; scheduled for amount/anchor.
+                gap_source = settled if len(settled) >= 2 else settled + scheduled_items
             elif len(settled) >= 3:
-                items = settled
+                gap_source = settled
             else:
                 continue
+            items = settled + scheduled_items if has_scheduled else settled
         else:
             settled = [
                 e
@@ -118,11 +124,18 @@ def detect_recurring_series(
             }:
                 continue
             items = settled
+            gap_source = items
 
-        gaps = [
-            (items[i]["settlement_date"] - items[i - 1]["settlement_date"]).days
-            for i in range(1, len(items))
-        ]
+        if is_income:
+            gaps = [
+                (gap_source[i]["settlement_date"] - gap_source[i - 1]["settlement_date"]).days
+                for i in range(1, len(gap_source))
+            ]
+        else:
+            gaps = [
+                (items[i]["settlement_date"] - items[i - 1]["settlement_date"]).days
+                for i in range(1, len(items))
+            ]
         if not gaps:
             continue
         mode_gap, _ = Counter(gaps).most_common(1)[0]
@@ -200,12 +213,16 @@ def build_daily_deltas(
     request_date: date,
     horizon_days: int = 90,
     series_overrides: dict[tuple[str, str, str], float | None] | None = None,
+    series_amount_forces: dict[tuple[str, str, str], float] | None = None,
 ) -> dict[date, float]:
     """Net cash deltas per day from confirmed futures + projected recurrings.
 
     series_overrides maps series key -> None (stop) or a float (reduced amount).
+    series_amount_forces sets projected amounts (e.g. payroll message overrides)
+    without stopping a series; spending overrides still win when present.
     """
     overrides = series_overrides or {}
+    amount_forces = series_amount_forces or {}
     stopped_keys = {key for key, value in overrides.items() if value is None}
     end_date = request_date + timedelta(days=horizon_days)
     deltas, occupied = _confirmed_future_deltas(
@@ -231,6 +248,8 @@ def build_daily_deltas(
             if overrides[key] is None:
                 continue
             amount = float(overrides[key])  # type: ignore[arg-type]
+        elif key in amount_forces:
+            amount = float(amount_forces[key])
         else:
             amount = series.amount
         cursor = series.last_settlement + timedelta(days=series.interval_days)
@@ -272,10 +291,13 @@ def forecast_balances(
     home_currency: str,
     rates: list[dict[str, Any]],
     horizon_days: int = 90,
+    series_amount_forces: dict[tuple[str, str, str], float] | None = None,
 ) -> dict[date, float]:
     """Project end-of-day balances for the forecast horizon (no request payment)."""
     _ = (home_currency, rates)
-    deltas = build_daily_deltas(events, request_date, horizon_days)
+    deltas = build_daily_deltas(
+        events, request_date, horizon_days, series_amount_forces=series_amount_forces
+    )
     balances: dict[date, float] = {}
     balance = starting_balance
     end_date = request_date + timedelta(days=horizon_days)
@@ -296,12 +318,15 @@ def amount_safe_to_pay(
     home_currency: str,
     rates: list[dict[str, Any]],
     horizon_days: int = 90,
+    series_amount_forces: dict[tuple[str, str, str], float] | None = None,
 ) -> float:
     """Largest amount safe to pay on request_date without spending changes."""
     _ = (home_currency, rates)
     if requested_amount <= 0:
         return 0.0
-    deltas = build_daily_deltas(events, request_date, horizon_days)
+    deltas = build_daily_deltas(
+        events, request_date, horizon_days, series_amount_forces=series_amount_forces
+    )
     max_cents = int(round(requested_amount * 100))
     lo, hi = 0, max_cents
     best = 0
@@ -333,10 +358,13 @@ def earliest_full_payment_date(
     home_currency: str,
     rates: list[dict[str, Any]],
     horizon_days: int = 90,
+    series_amount_forces: dict[tuple[str, str, str], float] | None = None,
 ) -> date | None:
     """First date a full payment is forecast-safe within the horizon."""
     _ = (home_currency, rates)
-    deltas = build_daily_deltas(events, request_date, horizon_days)
+    deltas = build_daily_deltas(
+        events, request_date, horizon_days, series_amount_forces=series_amount_forces
+    )
     end_date = request_date + timedelta(days=horizon_days)
     day = request_date
     while day <= end_date:
