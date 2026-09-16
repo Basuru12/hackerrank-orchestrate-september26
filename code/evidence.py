@@ -46,6 +46,8 @@ class EvidenceMeta:
     salary_amount_override: float | None = None
     salary_effective_date: date | None = None
     salary_date_override: date | None = None
+    # True = only next payday uses override; False = all future projections.
+    salary_force_permanent: bool = True
 
 
 def _parse_amount_token(raw: str) -> float:
@@ -215,6 +217,15 @@ def parse_message_overrides(
             candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
             meta.salary_amount_override = candidates[0][1]
             meta.salary_effective_date = sent_date
+            # Temporary / next-cycle adjustments vs permanent base pay.
+            if re.search(
+                r"(temporary|next salary|next payroll|penggajian berikutnya|"
+                r"untuk penggajian berikutnya|reduced amount continues for the next)",
+                lower,
+            ) and not re.search(r"(gaji pokok|base salary|pokok yang dikonfirmasi)", lower):
+                meta.salary_force_permanent = False
+            else:
+                meta.salary_force_permanent = True
 
         # Confirmed next salary without amount.
         if re.search(
@@ -224,15 +235,11 @@ def parse_message_overrides(
             r"(confirm|dikonfirmasi|confirmed).{0,60}(salary|gaji|next|berikutnya)",
             lower,
         ):
+            # Only record confirmation; do not invent a payday when history
+            # already supports a recurring salary series (avoids early earliest).
             if meta.salary_date_override is None and meta.salary_amount_override is None:
-                year, month = request_date.year, request_date.month
-                candidate = date(year, month, 15)
-                if candidate < request_date:
-                    if month == 12:
-                        candidate = date(year + 1, 1, 15)
-                    else:
-                        candidate = date(year, month + 1, 15)
-                meta.salary_date_override = candidate
+                meta.salary_effective_date = sent_date
+                # Leave salary_date_override unset unless an explicit date was parsed.
 
     return event_overrides, meta
 
@@ -270,7 +277,7 @@ def ensure_scheduled_salary(
     request_date: date,
     home_currency: str,
 ) -> list[dict[str, Any]]:
-    """Update existing scheduled salary; invent one only when a pay date is confirmed."""
+    """Update existing scheduled salary; invent one for confirmed date or next-cycle cut."""
     if meta.salary_date_override is None and meta.salary_amount_override is None:
         return events
     out = [copy.copy(e) for e in events]
@@ -295,10 +302,35 @@ def ensure_scheduled_salary(
         existing["include_in_cashflow"] = True
         return out
 
-    # Amount-only messages should override the recurring forecast via EvidenceMeta
-    # (cashflow series force). Inventing a scheduled row can break recurrence gaps.
-    if target_date is None:
+    # Permanent amount-only: cashflow series force covers projections.
+    if target_date is None and meta.salary_force_permanent:
         return out
+
+    # Temporary/next-cycle amount or explicit confirm date: anchor one scheduled credit.
+    if target_date is None:
+        settled = [
+            e
+            for e in out
+            if str(e.get("category", "")).lower() == "salary"
+            and str(e.get("status", "")).lower() == "settled"
+            and e.get("amount_home") is not None
+            and e["settlement_date"] < request_date
+        ]
+        if settled:
+            settled.sort(key=lambda e: e["settlement_date"])
+            last = settled[-1]["settlement_date"]
+            # Approximate next monthly payday from last settled salary date.
+            month = last.month + 1
+            year = last.year
+            if month > 12:
+                month = 1
+                year += 1
+            day = min(last.day, 28)
+            target_date = date(year, month, day)
+            if target_date < request_date:
+                target_date = request_date
+        else:
+            target_date = request_date
 
     if amount is None:
         settled = [
@@ -337,8 +369,8 @@ def ensure_scheduled_salary(
 
 
 def salary_series_overrides(meta: EvidenceMeta) -> dict[tuple[str, str, str], float]:
-    """Force projected salary series amounts from payroll message evidence."""
-    if meta.salary_amount_override is None:
+    """Force projected salary series amounts from permanent payroll evidence."""
+    if meta.salary_amount_override is None or not meta.salary_force_permanent:
         return {}
     amount = float(meta.salary_amount_override)
     return {

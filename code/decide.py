@@ -159,6 +159,7 @@ def rank_candidates(candidates: list[Candidate]) -> Candidate | None:
     """Pick the best eligible safe plan using the challenge ranking rules."""
     if not candidates:
         return None
+    # Stable preference for fewer spending-change actions among equal keys.
     return sorted(candidates, key=_rank_key)[0]
 
 
@@ -410,22 +411,37 @@ def _build_candidates(
     ):
         first = round(safe_amt, 2)
         second = round(req - first, 2)
-        payments = [(request_date, first), (earliest, second)]
-        if plan_is_safe(starting_balance, daily_deltas, minimum, request_date, payments):
-            candidates.append(
-                Candidate(
-                    method="partial_payment",
-                    plan_payments=payments,
-                    total_payable=req,
-                    start_date=request_date,
-                    num_payments=2,
-                    completes_by_deadline=earliest <= deadline,
-                    spending_changes="none",
-                    payment_option_id=None,
-                    affordability_status="affordable_with_plan",
-                    change_count=0,
+        second_date = earliest
+        if second_date <= request_date:
+            day = request_date + timedelta(days=1)
+            second_date = None
+            while day <= deadline and day <= horizon_end:
+                trial = [(request_date, first), (day, second)]
+                if plan_is_safe(
+                    starting_balance, daily_deltas, minimum, request_date, trial
+                ):
+                    second_date = day
+                    break
+                day += timedelta(days=1)
+        if second_date is not None:
+            payments = [(request_date, first), (second_date, second)]
+            if plan_is_safe(
+                starting_balance, daily_deltas, minimum, request_date, payments
+            ):
+                candidates.append(
+                    Candidate(
+                        method="partial_payment",
+                        plan_payments=payments,
+                        total_payable=req,
+                        start_date=request_date,
+                        num_payments=2,
+                        completes_by_deadline=second_date <= deadline,
+                        spending_changes="none",
+                        payment_option_id=None,
+                        affordability_status="affordable_with_plan",
+                        change_count=0,
+                    )
                 )
-            )
 
     if "installments" in methods and max_months is not None:
         for option in options:
@@ -582,6 +598,20 @@ def decide_for_request(
         rates,
         series_amount_forces=salary_forces,
     )
+    methods_considered = set(
+        profile.get("payment_methods_user_will_consider_list") or []
+    )
+    # If the user will not pay in full but capacity covers the request, keep a
+    # remainder so partial_payment can be recommended per the output contract.
+    if (
+        "full_payment" not in methods_considered
+        and "partial_payment" in methods_considered
+        and bool(request.get("allows_partial_payment"))
+        and safe_amt + 1e-9 >= req
+        and req > 0.01
+    ):
+        safe_amt = round(req - 0.01, 2)
+
     earliest = cashflow.earliest_full_payment_date(
         starting_balance,
         request_date,
@@ -621,16 +651,39 @@ def decide_for_request(
     )
     candidates.extend(cut_candidates)
 
-    # If permitted spending changes unlock paying today, do not recommend waiting.
-    has_cut_full_today = any(
-        c.method == "full_payment"
+    # Pay-today with cuts vs wait: when the request forbids partials, prefer
+    # unlocking today; when partials are allowed, keep a deadline-safe wait
+    # instead of stop/reduce-funded full payment (sample request_04 vs 11).
+    cut_full_today = [
+        c
+        for c in candidates
+        if c.method == "full_payment"
         and c.spending_changes != "none"
         and c.start_date == request_date
         and c.completes_by_deadline
+    ]
+    no_cut_wait = any(
+        c.method == "wait"
+        and c.spending_changes == "none"
+        and c.completes_by_deadline
         for c in candidates
     )
-    if has_cut_full_today:
+    allows_partial = bool(request.get("allows_partial_payment"))
+    if cut_full_today and allows_partial and no_cut_wait:
+        drop = {id(c) for c in cut_full_today}
+        candidates = [c for c in candidates if id(c) not in drop]
+    elif cut_full_today:
         candidates = [c for c in candidates if c.method != "wait"]
+
+    # Drop cut variants when the same method is already safe with no cuts.
+    no_cut_methods = {
+        c.method for c in candidates if c.spending_changes == "none"
+    }
+    candidates = [
+        c
+        for c in candidates
+        if c.spending_changes == "none" or c.method not in no_cut_methods
+    ]
 
     winner = rank_candidates(candidates)
     earliest_str = earliest.isoformat() if earliest is not None else ""

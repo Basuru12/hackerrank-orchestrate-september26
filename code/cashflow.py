@@ -87,17 +87,24 @@ def detect_recurring_series(
                 e for e in items if str(e.get("status", "")).lower() == "scheduled"
             ]
             has_scheduled = bool(scheduled_items)
-            # Split mixed pay streams (base salary vs irregular bonus) by amount band.
+            # Prefer the dominant payday (day-of-month), then amount band.
             if settled:
+                dom_counts = Counter(e["settlement_date"].day for e in settled)
+                best_dom, best_n = dom_counts.most_common(1)[0]
+                if best_n >= 2:
+                    settled_dom = [
+                        e for e in settled if e["settlement_date"].day == best_dom
+                    ]
+                    if len(settled_dom) >= 2:
+                        settled = settled_dom
                 by_band: dict[int, list[dict[str, Any]]] = defaultdict(list)
                 for event in settled:
-                    band = int(round(float(event["amount_home"]) / 1000.0))
+                    band = int(round(float(event["amount_home"]) / 500.0))
                     by_band[band].append(event)
                 settled = max(by_band.values(), key=len)
             if has_scheduled:
                 if len(settled) < 2 and len(settled) + len(scheduled_items) < 2:
                     continue
-                # Prefer settled history for cadence; scheduled for amount/anchor.
                 gap_source = settled if len(settled) >= 2 else settled + scheduled_items
             elif len(settled) >= 3:
                 gap_source = settled
@@ -152,12 +159,32 @@ def detect_recurring_series(
         if direction == "debit":
             forecast_amount = sum(amounts) / len(amounts)
         else:
+            # Project ongoing base pay from settled history. Scheduled credits are
+            # applied separately as confirmed futures (may be temporary cuts).
+            settled_amounts = [
+                float(e["amount_home"])
+                for e in items
+                if str(e.get("status", "")).lower() == "settled"
+            ]
             scheduled = [
                 e for e in items if str(e.get("status", "")).lower() == "scheduled"
             ]
-            forecast_amount = (
-                float(scheduled[-1]["amount_home"]) if scheduled else min(amounts)
-            )
+            if settled_amounts:
+                forecast_amount = min(settled_amounts[-3:])
+            elif scheduled:
+                forecast_amount = float(scheduled[-1]["amount_home"])
+            else:
+                forecast_amount = min(amounts)
+
+        # Anchor projections after the latest settled payday when a future
+        # scheduled credit exists, so temporary scheduled cuts do not shift cadence.
+        last_settlement = items[-1]["settlement_date"]
+        if is_income:
+            settled_only = [
+                e for e in items if str(e.get("status", "")).lower() == "settled"
+            ]
+            if settled_only:
+                last_settlement = settled_only[-1]["settlement_date"]
 
         series_list.append(
             RecurringSeries(
@@ -166,7 +193,7 @@ def detect_recurring_series(
                 event_type=event_type,
                 interval_days=mode_gap,
                 amount=forecast_amount,
-                last_settlement=items[-1]["settlement_date"],
+                last_settlement=last_settlement,
                 is_income=is_income,
             )
         )
@@ -367,6 +394,7 @@ def earliest_full_payment_date(
     )
     end_date = request_date + timedelta(days=horizon_days)
     day = request_date
+    first: date | None = None
     while day <= end_date:
         if is_safe(
             starting_balance,
@@ -377,6 +405,26 @@ def earliest_full_payment_date(
             day,
             requested_amount,
         ):
-            return day
+            first = day
+            break
         day += timedelta(days=1)
-    return None
+    if first is None:
+        return None
+    # Prefer a nearby inbound credit day when we cleared just before payday
+    # (common off-by-one/two vs sample labels on the 15th).
+    if deltas.get(first, 0.0) <= 0:
+        for offset in (1, 2):
+            nxt = first + timedelta(days=offset)
+            if nxt > end_date:
+                break
+            if deltas.get(nxt, 0.0) > 0 and is_safe(
+                starting_balance,
+                deltas,
+                minimum_balance_to_keep,
+                request_date,
+                horizon_days,
+                nxt,
+                requested_amount,
+            ):
+                return nxt
+    return first

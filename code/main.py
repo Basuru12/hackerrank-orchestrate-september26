@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -10,6 +11,17 @@ CODE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CODE_DIR.parent
 DATASET_DIR = REPO_ROOT / "dataset"
 OUTPUT_PATH = REPO_ROOT / "output.csv"
+
+OUTPUT_COLUMNS = [
+    "request_id",
+    "amount_safe_to_pay",
+    "affordability_status",
+    "recommended_payment_method",
+    "payment_plan",
+    "earliest_date_for_full_payment",
+    "spending_changes_needed",
+    "decision_explanation",
+]
 
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
@@ -29,30 +41,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _run_load_smoke(data: load_data.Dataset) -> int:
-    event_count = sum(len(events) for events in data.events_by_user.values())
-    option_count = sum(len(opts) for opts in data.options_by_request.values())
-    msg_count = sum(len(msgs) for msgs in data.messages_by_user.values())
-    print(
-        "loaded "
-        f"requests={len(data.requests)} "
-        f"profiles={len(data.profiles_by_user)} "
-        f"events={event_count} "
-        f"options={option_count} "
-        f"rates={len(data.rates)} "
-        f"samples={len(data.sample_requests)} "
-        f"messages={msg_count} "
-        f"images={len(data.images_by_event)}"
+def _decision_to_row(decision: decide.Decision) -> dict[str, str]:
+    safe = decision.amount_safe_to_pay
+    if abs(safe - round(safe)) < 1e-9:
+        safe_str = str(int(round(safe)))
+    else:
+        safe_str = f"{safe:.2f}"
+    return {
+        "request_id": decision.request_id,
+        "amount_safe_to_pay": safe_str,
+        "affordability_status": decision.affordability_status,
+        "recommended_payment_method": decision.recommended_payment_method,
+        "payment_plan": decision.payment_plan or "none",
+        "earliest_date_for_full_payment": decision.earliest_date_for_full_payment or "",
+        "spending_changes_needed": decision.spending_changes_needed or "none",
+        "decision_explanation": decision.decision_explanation or "",
+    }
+
+
+def _decide_one(data: load_data.Dataset, request: dict) -> decide.Decision:
+    user_id = request["user_id"]
+    request_id = request["request_id"]
+    return decide.decide_for_request(
+        request,
+        profile=data.profiles_by_user.get(user_id, {}),
+        events=data.events_by_user.get(user_id, []),
+        options=data.options_by_request.get(request_id, []),
+        rates=data.rates,
+        messages=data.messages_by_user.get(user_id, []),
+        images_by_event=data.images_by_event,
+        rates_by_key=data.rates_by_key,
     )
-    first = data.requests[0]
-    user_id = first["user_id"]
-    profile = data.profiles_by_user.get(user_id)
-    user_events = data.events_by_user.get(user_id, [])
-    if profile is None or not user_events:
-        print(f"join failed {first['request_id']} {user_id}")
-        return 1
-    print(f"join ok {first['request_id']} {user_id} events={len(user_events)}")
-    return 0
+
+
+def _run_full_predictions(data: load_data.Dataset, output_path: Path) -> int:
+    """Score every eval request and write root output.csv."""
+    rows: list[dict[str, str]] = []
+    for index, request in enumerate(data.requests, start=1):
+        decision = _decide_one(data, request)
+        rows.append(_decision_to_row(decision))
+        if index == 1 or index % 50 == 0 or index == len(data.requests):
+            print(f"scored {index}/{len(data.requests)} {request['request_id']}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"wrote {len(rows)} rows to {output_path}")
+    return 0 if len(rows) == len(data.requests) else 1
 
 
 def _normalize_plan(plan: str | None) -> str:
@@ -70,26 +108,19 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
     changes_exact = 0
     total = len(data.sample_requests)
     mismatches: list[str] = []
-    focus_ids = {"request_06", "request_11", "request_21", "request_01"}
+    safe_fails: list[tuple[float, str]] = []
+    focus_ids = {
+        "request_01",
+        "request_06",
+        "request_08",
+        "request_11",
+        "request_21",
+    }
+    request_01_ok = True
 
     for sample in data.sample_requests:
         request_id = sample["request_id"]
-        user_id = sample["user_id"]
-        profile = data.profiles_by_user[user_id]
-        events = data.events_by_user.get(user_id, [])
-        options = data.options_by_request.get(request_id, [])
-
-        messages = data.messages_by_user.get(user_id, [])
-        decision = decide.decide_for_request(
-            sample,
-            profile=profile,
-            events=events,
-            options=options,
-            rates=data.rates,
-            messages=messages,
-            images_by_event=data.images_by_event,
-            rates_by_key=data.rates_by_key,
-        )
+        decision = _decide_one(data, sample)
 
         label_safe = float(sample.get("amount_safe_to_pay", 0) or 0)
         label_earliest = sample.get("earliest_date_for_full_payment")
@@ -114,6 +145,19 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
             safe_exact += 1
         if within_1 or exact_safe:
             safe_within_1pct += 1
+        else:
+            pct = (
+                100.0 * safe_diff / label_safe
+                if label_safe > 0
+                else (100.0 if pred_safe else 0.0)
+            )
+            safe_fails.append(
+                (
+                    safe_diff,
+                    f"{request_id}: safe label={label_safe} pred={pred_safe} "
+                    f"diff={safe_diff:.2f} ({pct:.1f}%)",
+                )
+            )
         if pred_earliest == label_earliest_str:
             earliest_exact += 1
 
@@ -130,12 +174,18 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         if changes_ok:
             changes_exact += 1
 
-        if request_id in focus_ids or not (method_ok and status_ok and changes_ok):
+        if request_id == "request_01" and not (
+            exact_safe and pred_earliest == label_earliest_str and method_ok
+        ):
+            request_01_ok = False
+
+        if request_id in focus_ids or not method_ok:
             print(
                 f"{request_id}: method pred={decision.recommended_payment_method} "
                 f"label={label_method} | status pred={decision.affordability_status} "
                 f"label={label_status} | changes pred={decision.spending_changes_needed!r} "
-                f"label={label_changes!r} | plan_ok={plan_ok}"
+                f"label={label_changes!r} | plan_ok={plan_ok} | "
+                f"safe {pred_safe}/{label_safe} | ear {pred_earliest!r}/{label_earliest_str!r}"
             )
         if not (method_ok and status_ok and plan_ok and changes_ok):
             mismatches.append(
@@ -154,6 +204,21 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
         f"plan_exact={plan_exact}/{total} "
         f"changes_exact={changes_exact}/{total}"
     )
+    print(
+        "fails "
+        f"safe={total - safe_exact} "
+        f"safe_1pct={total - safe_within_1pct} "
+        f"earliest={total - earliest_exact} "
+        f"method={total - method_exact} "
+        f"status={total - status_exact} "
+        f"plan={total - plan_exact} "
+        f"changes={total - changes_exact} "
+        f"request_01_ok={request_01_ok}"
+    )
+    if safe_fails:
+        print("worst safe deltas:")
+        for _, line in sorted(safe_fails, key=lambda item: item[0], reverse=True)[:8]:
+            print(f"  {line}")
     if mismatches:
         print("mismatches (up to 10):")
         for line in mismatches[:10]:
@@ -165,11 +230,10 @@ def _run_sample_validation(data: load_data.Dataset) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    _ = OUTPUT_PATH
     data = load_data.load_dataset(DATASET_DIR)
     if args.samples:
         return _run_sample_validation(data)
-    return _run_load_smoke(data)
+    return _run_full_predictions(data, OUTPUT_PATH)
 
 
 if __name__ == "__main__":
